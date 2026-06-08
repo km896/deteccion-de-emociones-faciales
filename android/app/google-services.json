@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1081826169029",
+    "project_id": "emotionface-687d1",
+    "storage_bucket": "emotionface-687d1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1081826169029:android:5e4dc31244387f92f760ac",
+        "android_client_info": {
+          "package_name": "com.example.flutter_face_auth_2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDMFPvZ4QxxD8ymO14dOJF3p4oINwtBksg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

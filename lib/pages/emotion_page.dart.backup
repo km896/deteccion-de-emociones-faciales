@@ -1,0 +1,968 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:permission_handler/permission_handler.dart';
+import '../widgets/face_painter.dart';
+
+enum Emotion { happy, sad, surprised, angry, neutral, sleepy, thinking }
+
+class EmotionPage extends StatefulWidget {
+  final String? userName;
+  const EmotionPage({super.key, this.userName});
+
+  @override
+  State<EmotionPage> createState() => _EmotionPageState();
+}
+
+class _EmotionPageState extends State<EmotionPage>
+    with TickerProviderStateMixin {
+  CameraController? _controller;
+  CameraDescription? _cameraDescription;
+  late FaceDetector _faceDetector;
+
+  bool _isInitialized = false;
+  bool _isDetecting = false;
+  bool _showStats = false;
+  bool _hasFace = false;
+  String _statusMsg = '';
+  Face? _currentFace;
+  Size _imageSize = Size.zero;
+  DateTime _lastProcessed = DateTime.now();
+  InputImageRotation _currentRotation = InputImageRotation.rotation270deg;
+
+  late AnimationController _pulseAnim;
+  late AnimationController _emotionAnim;
+
+  Emotion _emotion = Emotion.neutral;
+  double _confidence = 0.7;
+  double _smiling = 0;
+  double _leftEye = 1;
+  double _rightEye = 1;
+
+  final List<_EmotionEntry> _history = [];
+  final List<Emotion> _smoothingBuffer = [];
+  final Map<Emotion, int> _emotionCount = {
+    for (final e in Emotion.values) e: 0
+  };
+  int _totalFrames = 0;
+  final DateTime _sessionStart = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseAnim = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 1200))
+      ..repeat(reverse: true);
+    _emotionAnim = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 500));
+    _faceDetector = FaceDetector(
+      options: FaceDetectorOptions(
+        performanceMode: FaceDetectorMode.accurate,
+        enableLandmarks: true,
+        enableClassification: true,
+        enableContours: true,
+        enableTracking: true,
+      ),
+    );
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      debugPrint('🔄 Iniciando cámara...');
+      
+      final cameraStatus = await Permission.camera.request();
+      debugPrint('📷 Estado permiso cámara: $cameraStatus');
+      
+      if (!cameraStatus.isGranted) {
+        debugPrint('❌ Camera permission denied');
+        if (mounted) {
+          setState(() => _statusMsg = 'Permiso de cámara requerido');
+        }
+        return;
+      }
+
+      final cameras = await availableCameras();
+      debugPrint('📷 Cámaras disponibles: ${cameras.length}');
+      
+      if (cameras.isEmpty) {
+        debugPrint('❌ No cameras available');
+        return;
+      }
+      final front = cameras.firstWhere(
+              (c) => c.lensDirection == CameraLensDirection.front,
+          orElse: () => cameras.first,
+      );
+      debugPrint('📷 Usando cámara: ${front.name} orient:${front.sensorOrientation}');
+      _cameraDescription = front;
+
+      final ctrl = CameraController(
+        front,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.nv21,
+      );
+      debugPrint('📷 Inicializando CameraController con nv21...');
+      
+      await ctrl.initialize();
+      debugPrint('📷 CameraController inicializado');
+      debugPrint('📷 Preview size: ${ctrl.value.previewSize}');
+      
+      if (!mounted) return;
+
+      setState(() {
+        _controller = ctrl;
+        _isInitialized = true;
+      });
+      debugPrint('✅ Cámara lista!');
+
+      _lastProcessed = DateTime.now();
+      await ctrl.startImageStream(_onCameraImage);
+      debugPrint('📹 Stream de imágenes iniciado');
+    } catch (e, st) {
+      debugPrint('❌ Camera error: $e');
+      debugPrint('Stack trace: $st');
+    }
+  }
+
+  void _onCameraImage(CameraImage image) {
+    final now = DateTime.now();
+    if (now.difference(_lastProcessed).inmilliseconds < 1000) return;
+    if (_isDetecting) return;
+    _lastProcessed = now;
+    _processImage(image);
+  }
+
+  Future<void> _processImage(CameraImage image) async {
+    if (_isDetecting) return;
+    _isDetecting = true;
+
+    try {
+      final inputImage = _toInputImage(image);
+      if (inputImage == null) {
+        _isDetecting = false;
+        return;
+      }
+
+      final faces = await _faceDetector.processImage(inputImage);
+      if (!mounted) return;
+
+      if (faces.isEmpty) {
+        setState(() {
+          _hasFace = false;
+          _currentFace = null;
+        });
+        _isDetecting = false;
+        return;
+      }
+
+      final face = faces.first;
+      final detected = _analyzeEmotion(face);
+
+      _smoothingBuffer.add(detected);
+      if (_smoothingBuffer.length > 5) _smoothingBuffer.removeAt(0);
+      final smoothed = _mostFrequent(_smoothingBuffer);
+
+      final now = DateTime.now();
+      if (_history.isEmpty ||
+          now.difference(_history.last.time).inSeconds >= 2) {
+        _history.add(_EmotionEntry(emotion: smoothed, time: now));
+        if (_history.length > 20) _history.removeAt(0);
+      }
+
+      _emotionCount[smoothed] = (_emotionCount[smoothed] ?? 0) + 1;
+      _totalFrames++;
+
+      if (smoothed != _emotion) _emotionAnim.forward(from: 0);
+
+      setState(() {
+        _hasFace = true;
+        _currentFace = face;
+        _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+        _emotion = smoothed;
+        _confidence = _calcConfidence(face, smoothed);
+        _smiling = face.smilingProbability ?? 0;
+        _leftEye = face.leftEyeOpenProbability ?? 1;
+        _rightEye = face.rightEyeOpenProbability ?? 1;
+      });
+    } catch (e) {
+      debugPrint('❌ Process error: $e');
+    } finally {
+      _isDetecting = false;
+    }
+  }
+
+  InputImage? _toInputImage(CameraImage image) {
+    final camera = _cameraDescription;
+    if (camera == null) {
+      debugPrint('❌ _toInputImage: No camera description');
+      return null;
+    }
+
+    InputImageRotation rotation;
+    if (Platform.isAndroid) {
+      rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation) 
+          ?? InputImageRotation.rotation270deg;
+    } else {
+      rotation = InputImageRotation.rotation90deg;
+    }
+    _currentRotation = rotation;
+
+    InputImageFormat format;
+    if (Platform.isAndroid) {
+      format = InputImageFormat.nv21;
+    } else {
+      format = InputImageFormat.bgra8888;
+    }
+
+    if (image.planes.isEmpty) {
+      debugPrint('❌ _toInputImage: No planes in image');
+      return null;
+    }
+
+    final plane = image.planes.first;
+    debugPrint('📷 Image: ${image.width}x${image.height}, format: $format, rotation: $rotation');
+
+    return InputImage.fromBytes(
+      bytes: plane.bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
+  }
+
+  Emotion _analyzeEmotion(Face face) {
+    final s = face.smilingProbability ?? 0.0;
+    final l = face.leftEyeOpenProbability ?? 1.0;
+    final r = face.rightEyeOpenProbability ?? 1.0;
+    final ey = (face.headEulerAngleY ?? 0).abs();
+    final ez = face.headEulerAngleZ ?? 0;
+    final avg = (l + r) / 2;
+    
+    debugPrint('🧠 Raw probs - smile: ${s.toStringAsFixed(3)}, leftEye: ${l.toStringAsFixed(3)}, rightEye: ${r.toStringAsFixed(3)}, avg: ${avg.toStringAsFixed(3)}, ey: ${ey.toStringAsFixed(1)}, ez: ${ez.toStringAsFixed(1)}');
+    
+    // Feliz: sonrisa clara Y ojos abiertos
+    if (s > 0.65 && avg > 0.6) return Emotion.happy;
+    
+    // Sorprendido: ojos muy abiertos, sin sonrisa, cabeza centrada
+    if (avg > 0.9 && s < 0.15 && ey < 8) return Emotion.surprised;
+    
+    // Somnoliento: ojos notablemente cerrados
+    if (avg < 0.25) return Emotion.sleepy;
+    
+    // Triste: sonrisa baja, sin requisito estricto de ojos (antes que enojado)
+    if (s < 0.2 && avg < 0.65) return Emotion.sad;
+    
+    // Pensativo: inclinación de cabeza significativa
+    if (ez.abs() > 30 && s < 0.35) return Emotion.thinking;
+    
+    // Enojado: ojos cerrados y sin sonrisa, cabeza centrada
+    if (avg < 0.35 && s < 0.1 && ey < 12) return Emotion.angry;
+    
+    return Emotion.neutral;
+  }
+
+  double _calcConfidence(Face face, Emotion e) {
+    final s = face.smilingProbability ?? 0.0;
+    final eye = ((face.leftEyeOpenProbability ?? 1.0) +
+        (face.rightEyeOpenProbability ?? 1.0)) /
+        2;
+    switch (e) {
+      case Emotion.happy:
+        return s;
+      case Emotion.surprised:
+        return eye;
+      case Emotion.sleepy:
+        return (1 - eye).clamp(0.0, 1.0);
+      case Emotion.angry:
+        return (1 - s).clamp(0.0, 1.0);
+      case Emotion.sad:
+        return (1 - s).clamp(0.0, 1.0);
+      default:
+        return 0.72;
+    }
+  }
+
+  Emotion _mostFrequent(List<Emotion> list) {
+    final c = <Emotion, int>{};
+    for (final e in list) {
+      c[e] = (c[e] ?? 0) + 1;
+    }
+    return c.entries.reduce((a, b) => a.value > b.value ? a : b).key;
+  }
+
+  _EmotionData dataFor(Emotion e) {
+    switch (e) {
+      case Emotion.happy:
+        return _EmotionData('😄', 'Feliz', 'Happy',
+            const Color(0xFFFFD93D), const Color(0xFF3D2800));
+      case Emotion.sad:
+        return _EmotionData('😢', 'Triste', 'Sad',
+            const Color(0xFF6C9BCF), const Color(0xFF0A1929));
+      case Emotion.surprised:
+        return _EmotionData('😮', 'Sorprendido', 'surprised',
+            const Color(0xFFFF8C42), const Color(0xFF2D1400));
+      case Emotion.angry:
+        return _EmotionData('😠', 'Enojado', 'Angry',
+            const Color(0xFFEF5350), const Color(0xFF1A0000));
+      case Emotion.sleepy:
+        return _EmotionData('😴', 'Somnoliento', 'Sleepy',
+            const Color(0xFF7E57C2), const Color(0xFF0D0020));
+      case Emotion.thinking:
+        return _EmotionData('🤔', 'Pensativo', 'Thinking',
+            const Color(0xFF26C6DA), const Color(0xFF001520));
+      case Emotion.neutral:
+        return _EmotionData('😐', 'Neutral', 'Neutral',
+            const Color(0xFF4F8EF7), const Color(0xFF050D1F));
+    }
+  }
+
+  Emotion get _dominantEmotion {
+    if (_totalFrames == 0) return Emotion.neutral;
+    return _emotionCount.entries
+        .reduce((a, b) => a.value > b.value ? a : b)
+        .key;
+  }
+
+  String get _sessionDuration {
+    final diff = DateTime.now().difference(_sessionStart);
+    final m = diff.inMinutes.toString().padLeft(2, '0');
+    final s = (diff.inSeconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  String _timeAgo(DateTime t) {
+    final diff = DateTime.now().difference(t).inSeconds;
+    if (diff < 5) return 'ahora';
+    if (diff < 60) return '${diff}s';
+    return '${diff ~/ 60}m';
+  }
+
+  @override
+  void dispose() {
+    if (_controller?.value.isStreamingImages ?? false) {
+      _controller?.stopImageStream();
+    }
+    _controller?.dispose();
+    _faceDetector.close();
+    _pulseAnim.dispose();
+    _emotionAnim.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildConText conText) {
+    if (!_isInitialized || _controller == null) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF060810),
+        body: Center(
+          child: Column(MainAxisSize: MainAxisSize.min, children: [
+            const CircularProgressIndicator(color: Color(0xFF4F8EF7)),
+            const SizedBox(height: 16),
+            Text(
+                _statusMsg.isEmpty ? 'Iniciando cámara...' : _statusMsg,
+                style: const TextStyle(color: Colors.white54, fontSize: 14)),
+          ]),
+        ),
+      );
+    }
+
+    final d = dataFor(_emotion);
+    
+    debugPrint('🎨 Building camera view: hasFace=$_hasFace, currentFace=${_currentFace != null}');
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: _showStats ? _buildStatsView(d) : _buildCameraView(d),
+    );
+  }
+
+  // ── Vista cámara ─────────────────────────
+  Widget _buildCameraView(_EmotionData d) {
+    final previewSize = _controller!.value.previewSize!;
+    
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // CameraPreview con malla facial (estructura igual que login_page)
+        Positioned.fill(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: previewSize.height, // invertidos a propósito
+              height: previewSize.width,
+              child: OverflowBox(
+                maxWidth: double.infinity,
+                maxHeight: double.infinity,
+                child: FittedBox(
+                  fit: BoxFit.cover,
+                  child: SizedBox(
+                    width: previewSize.height,
+                    height: previewSize.width,
+                    child: Stack(
+                      children: [
+                        CameraPreview(_controller!),
+                        if (_currentFace != null && _imageSize != Size.zero)
+                          CustomPaint(
+                            painter: FacePainter(
+                              face: _currentFace,
+                              imageSize: _imageSize,
+                              color: d.color,
+                              isFrontCamera:
+                                  _cameraDescription?.lensDirection == CameraLensDirection.front,
+                              rotation: _currentRotation,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+
+        // Gradiente dinámico por emoción
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 700),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                Colors.black.withValues(alpha: 0.45),
+                Colors.transparent,
+                d.bgColor.withValues(alpha: 0.7),
+              ],
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              stops: const [0.0, 0.4, 1.0],
+            ),
+          ),
+        ),
+
+        // UI encima de la cámara
+        SafeArea(
+          child: Column(children: [
+            _buildHeader(d),
+            const Spacer(),
+
+            // Badge emoción flotante
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 400),
+              child: _hasFace
+                  ? _buildEmotionBadge(d)
+                  : _buildSearchingBadge(),
+            ),
+
+            const SizedBox(height: 16),
+
+            // Panel inferior
+            _buildBottomPanel(d),
+
+            const SizedBox(height: 16),
+          ]),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEmotionBadge(_EmotionData d) {
+    return AnimatedBuilder(
+      animation: _pulseAnim,
+      key: ValueKey(_emotion),
+      builder: (_, child) => Transform.scale(
+        scale: 1.0 + _pulseAnim.value * 0.03,
+        child: child,
+      ),
+      child: Container(
+        Padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 16),
+        decoration: BoxDecoration(
+          BorderRadius: BorderRadius.circular(50),
+          color: Colors.black.withValues(alpha: 0.6),
+          Border: Border.all(
+              color: d.color.withValues(alpha: 0.7), width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: d.color.withValues(alpha: 0.4),
+              blurRadius: 20,
+              spreadRadius: 2,
+            ),
+          ],
+        ),
+        child: Row(MainAxisSize: MainAxisSize.min, children: [
+          Text(d.emoji, style: const TextStyle(fontSize: 42)),
+          const SizedBox(width: 14),
+          Column(CrossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(d.name,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: -0.5)),
+            Text('${(_confidence * 100).toInt()}% confianza',
+                style: TextStyle(
+                    color: d.color,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600)),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildSearchingBadge() {
+    return Container(
+      key: const ValueKey('searching'),
+      Padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      decoration: BoxDecoration(
+        BorderRadius: BorderRadius.circular(50),
+        color: Colors.black.withValues(alpha: 0.5),
+        Border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+      ),
+      child: Row(MainAxisSize: MainAxisSize.min, children: [
+        SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Colors.white.withValues(alpha: 0.5),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text('Buscando rostro...',
+            style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.5), fontSize: 14)),
+      ]),
+    );
+  }
+
+  Widget _buildBottomPanel(_EmotionData d) {
+    return Padding(
+      Padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(children: [
+        if (_hasFace)
+          Row(children: [
+            _MetricCard(
+                label: 'Sonrisa',
+                value: _smiling,
+                Icon: '😊',
+                color: const Color(0xFFFFD93D)),
+            const SizedBox(width: 8),
+            _MetricCard(
+                label: 'Ojo izq',
+                value: _leftEye,
+                Icon: '👁',
+                color: const Color(0xFF4F8EF7)),
+            const SizedBox(width: 8),
+            _MetricCard(
+                label: 'Ojo der',
+                value: _rightEye,
+                Icon: '👁',
+                color: const Color(0xFF7B5EA7)),
+          ]),
+        if (_hasFace) const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: _history.isEmpty
+                ? const SizedBox()
+                : SizedBox(
+              height: 40,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: _history.length,
+                itemBuilder: (_, i) {
+                  final entry = _history[_history.length - 1 - i];
+                  final ed = dataFor(entry.emotion);
+                  final isLatest = i == 0;
+                  return Container(
+                    margin: const EdgeInsets.only(right: 6),
+                    Padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      BorderRadius: BorderRadius.circular(10),
+                      color: isLatest
+                          ? ed.color.withValues(alpha: 0.25)
+                          : Colors.black.withValues(alpha: 0.4),
+                      Border: Border.all(
+                          color: isLatest
+                              ? ed.color.withValues(alpha: 0.5)
+                              : Colors.white.withValues(alpha: 0.08)),
+                    ),
+                    child: Row(children: [
+                      Text(ed.emoji,
+                          style: const TextStyle(fontSize: 14)),
+                      const SizedBox(width: 4),
+                      Text(_timeAgo(entry.time),
+                          style: TextStyle(
+                              color:
+                              Colors.white.withValues(alpha: 0.4),
+                              fontSize: 9)),
+                    ]),
+                  );
+                },
+              ),
+            ),
+          ),
+          GestureDetector(
+            onTap: () => setState(() => _showStats = true),
+            child: Container(
+              Padding:
+              const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                BorderRadius: BorderRadius.circular(14),
+                color: Colors.black.withValues(alpha: 0.55),
+                Border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.15)),
+              ),
+              child: Row(children: [
+                const Icon(Icons.bar_chart_rounded,
+                    color: Colors.white60, size: 16),
+                const SizedBox(width: 6),
+                Text('Stats',
+                    style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.6),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  // ── Vista estadísticas ────────────────────────
+  Widget _buildStatsView(_EmotionData d) {
+    final domData = dataFor(_dominantEmotion);
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [const Color(0xFF060810), d.bgColor],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+      ),
+      child: SafeArea(
+        child: Column(children: [
+          Padding(
+            Padding:
+            const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            child: Row(children: [
+              GestureDetector(
+                onTap: () => setState(() => _showStats = false),
+                child: Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.08),
+                    BorderRadius: BorderRadius.circular(12),
+                    Border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.12)),
+                  ),
+                  child: const Icon(Icons.arRow_back_ios_new_rounded,
+                      color: Colors.white, size: 16),
+                ),
+              ),
+              const SizedBox(width: 14),
+              const Text('Estadísticas',
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: -0.5)),
+            ]),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              Padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Column(children: [
+                Container(
+                  Padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    BorderRadius: BorderRadius.circular(24),
+                    color: Colors.white.withValues(alpha: 0.05),
+                    Border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.1)),
+                  ),
+                  child: Row(children: [
+                    Column(
+                        CrossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Sesión activa',
+                              style: TextStyle(
+                                  color:
+                                  Colors.white.withValues(alpha: 0.4),
+                                  fontSize: 11)),
+                          Text(_sessionDuration,
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 36,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: -1.5)),
+                          Text('$_totalFrames análisis',
+                              style: TextStyle(
+                                  color:
+                                  Colors.white.withValues(alpha: 0.35),
+                                  fontSize: 12)),
+                        ]),
+                    const Spacer(),
+                    Column(children: [
+                      Text(domData.emoji,
+                          style: const TextStyle(fontSize: 64)),
+                      Text('Dominante',
+                          style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.4),
+                              fontSize: 12)),
+                      Text(domData.name,
+                          style: TextStyle(
+                              color: domData.color,
+                              fontSize: 18,
+                              fontWeight: FontWeight.w800)),
+                    ]),
+                  ]),
+                ),
+                const SizedBox(height: 14),
+                Container(
+                  Padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    BorderRadius: BorderRadius.circular(24),
+                    color: Colors.white.withValues(alpha: 0.04),
+                    Border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.08)),
+                  ),
+                  child: Column(
+                    CrossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Distribución emocional',
+                          style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.5),
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 16),
+                      ...Emotion.values.map((e) {
+                        final count = _emotionCount[e] ?? 0;
+                        final pct =
+                        _totalFrames > 0 ? count / _totalFrames : 0.0;
+                        final ed = dataFor(e);
+                        return Padding(
+                          Padding: const EdgeInsets.only(bottom: 10),
+                          child: Row(children: [
+                            Text(ed.emoji,
+                                style: const TextStyle(fontSize: 24)),
+                            const SizedBox(width: 8),
+                            SizedBox(
+                              width: 82,
+                              child: Text(ed.name,
+                                  style: TextStyle(
+                                      color: Colors.white
+                                          .withValues(alpha: 0.65),
+                                      fontSize: 12)),
+                            ),
+                            Expanded(
+                              child: ClipRRect(
+                                BorderRadius: BorderRadius.circular(6),
+                                child: LinearProgressIndicator(
+                                  value: pct,
+                                  minHeight: 10,
+                                  backgroundColor: Colors.white
+                                      .withValues(alpha: 0.06),
+                                  valueColor:
+                                  AlwaysStoppedAnimation(ed.color),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            SizedBox(
+                              width: 36,
+                              child: Text('${(pct * 100).toInt()}%',
+                                  TextAlign: TextAlign.right,
+                                  style: TextStyle(
+                                      color: pct > 0
+                                          ? ed.color
+                                          : Colors.white24,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700)),
+                            ),
+                          ]),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
+                if (_history.isNotEmpty)
+                  Container(
+                    Padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      BorderRadius: BorderRadius.circular(24),
+                      color: Colors.white.withValues(alpha: 0.04),
+                      Border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.08)),
+                    ),
+                    child: Column(
+                      CrossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Historial',
+                            style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.5),
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 12),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: _history.reversed.map((entry) {
+                            final ed = dataFor(entry.emotion);
+                            return Container(
+                              Padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 6),
+                              decoration: BoxDecoration(
+                                BorderRadius: BorderRadius.circular(10),
+                                color: ed.color.withValues(alpha: 0.12),
+                                Border: Border.all(
+                                    color:
+                                    ed.color.withValues(alpha: 0.3)),
+                              ),
+                              child: Row(
+                                  MainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(ed.emoji,
+                                        style:
+                                        const TextStyle(fontSize: 18)),
+                                    const SizedBox(width: 5),
+                                    Text(_timeAgo(entry.time),
+                                        style: TextStyle(
+                                            color: ed.color
+                                                .withValues(alpha: 0.8),
+                                            fontSize: 11)),
+                                  ]),
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 20),
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildHeader(_EmotionData d) {
+    return Padding(
+      Padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      child: Row(children: [
+        Column(CrossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(
+              widget.userName != null && widget.userName!.isNotEmpty
+                  ? 'Hola, ${widget.userName}'
+                  : 'Análisis Facial',
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.4)),
+          Row(children: [
+            AnimatedBuilder(
+              animation: _pulseAnim,
+              builder: (_, __) => Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _hasFace
+                      ? Color.lerp(
+                      const Color(0xFF4CAF50),
+                      const Color(0xFF8BC34A),
+                      _pulseAnim.value)!
+                      : Colors.white24,
+                ),
+              ),
+            ),
+            const SizedBox(width: 5),
+            Text(_sessionDuration,
+                style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.5),
+                    fontSize: 12)),
+            const SizedBox(width: 6),
+            Text('· $_totalFrames análisis',
+                style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.3),
+                    fontSize: 12)),
+          ]),
+        ]),
+      ]),
+    );
+  }
+}
+
+// ── Widgets auxiliares ────────────────────────
+
+class _MetricCard extends StatelessWidget {
+  final String label, Icon;
+  final double value;
+  final Color color;
+  const _MetricCard(
+      {required this.label,
+      required this.value,
+      required this.Icon,
+      required this.color});
+
+  @override
+  Widget build(BuildConText conText) {
+    return Expanded(
+      child: Container(
+        Padding:
+        const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        decoration: BoxDecoration(
+          BorderRadius: BorderRadius.circular(14),
+          color: Colors.black.withValues(alpha: 0.55),
+          Border: Border.all(color: color.withValues(alpha: 0.25)),
+        ),
+        child: Column(children: [
+          Text(Icon, style: const TextStyle(fontSize: 18)),
+          const SizedBox(height: 3),
+          Text('${(value * 100).toInt()}%',
+              style: TextStyle(
+                  color: color,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800)),
+          Text(label,
+              style: TextStyle(
+                  color: Colors.white.withValues(alpha: 0.4),
+                  fontSize: 10)),
+          const SizedBox(height: 5),
+          ClipRRect(
+            BorderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: value,
+              minHeight: 4,
+              backgroundColor: Colors.white.withValues(alpha: 0.07),
+              valueColor: AlwaysStoppedAnimation(color),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class _EmotionData {
+  final String emoji, name, nameEn;
+  final Color color, bgColor;
+  _EmotionData(
+      this.emoji, this.name, this.nameEn, this.color, this.bgColor);
+}
+
+class _EmotionEntry {
+  final Emotion emotion;
+  final DateTime time;
+  _EmotionEntry({required this.emotion, required this.time});
+}
